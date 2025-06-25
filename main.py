@@ -6,6 +6,8 @@ import os
 import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
+import matplotlib.pyplot as plt
+import io
 
 # -------------------------------------
 # --- Firebase Firestore Setup ---
@@ -123,6 +125,7 @@ async def on_ready():
 # --- Command Groups ---
 # -------------------------------------
 elo = SlashCommandGroup("elo", "ELO system commands")
+stats = SlashCommandGroup("stats", "View detailed player and match statistics")
 profile_group = SlashCommandGroup("profile", "Manage and view player profiles")
 
 # -------------------------------------
@@ -170,9 +173,20 @@ async def view_profile(ctx: discord.ApplicationContext, player: discord.Member =
     elo_overall = get_overall_elo(player_data)
     embed.add_field(name="ELO Ratings", value=f"**Overall:** `{elo_overall}` (Tier: {get_player_tier(elo_overall)})\n"
               f"**NA:** `{player_data.get('elo_na', STARTING_ELO)}` | **EU:** `{player_data.get('elo_eu', STARTING_ELO)}` | **AS:** `{player_data.get('elo_as', STARTING_ELO)}`", inline=False)
+
+    winner_query = db.collection('match_history').where('winner_id', '==', str(target_user.id)).order_by('timestamp', direction='DESCENDING').limit(5).stream()
+    loser_query = db.collection('match_history').where('loser_id', '==', str(target_user.id)).order_by('timestamp', direction='DESCENDING').limit(5).stream()
+    matches = sorted(list(winner_query) + list(loser_query), key=lambda x: x.to_dict()['timestamp'], reverse=True)
+    
+    match_history_str = "No recent matches found." if not matches else ""
+    for match_doc in matches[:5]:
+        match = match_doc.to_dict()
+        outcome = f"✅ Win vs <@{match['loser_id']}>" if match['winner_id'] == str(target_user.id) else f"❌ Loss vs <@{match['winner_id']}>"
+        match_history_str += f"`{match_doc.id[:6]}`: {outcome} ({match['region']})\n"
+    embed.add_field(name="Recent Match History (ID: Outcome vs Opponent)", value=match_history_str, inline=False)
     await ctx.followup.send(embed=embed)
 
-@elo.command(name="report_match", description="Manually report the result of a match.")
+@elo.command(name="report_match", description="Manually report the result of a match (e.g., 3rd place match).")
 @discord.option("winner", description="The Discord user who won.", type=discord.Member, required=True)
 @discord.option("loser", description="The Discord user who lost.", type=discord.Member, required=True)
 @discord.option("region", description="The region the match was played in.", choices=["NA", "EU", "AS"], required=True)
@@ -202,6 +216,59 @@ async def leaderboard(ctx: discord.ApplicationContext, region: str):
         lb_string += f"{rank_display} **{player.get('roblox_username', 'Unknown')}** - `{elo_score}` ELO (Tier: {get_player_tier(elo_score)})\n"
     embed.add_field(name="Top 10 Rankings", value=lb_string or "No players found.", inline=False)
     await ctx.followup.send(embed=embed)
+
+@stats.command(name="h2h", description="View the head-to-head record between two players.")
+@discord.option("player1", description="The first player.", type=discord.Member, required=True)
+@discord.option("player2", description="The second player.", type=discord.Member, required=True)
+async def h2h(ctx: discord.ApplicationContext, player1: discord.Member, player2: discord.Member):
+    await ctx.defer()
+    p1_wins = len(list(db.collection('match_history').where('winner_id', '==', str(player1.id)).where('loser_id', '==', str(player2.id)).stream()))
+    p2_wins = len(list(db.collection('match_history').where('winner_id', '==', str(player2.id)).where('loser_id', '==', str(player1.id)).stream()))
+    embed = discord.Embed(title=f"Head-to-Head: {player1.display_name} vs {player2.display_name}", color=discord.Color.teal())
+    embed.add_field(name=player1.display_name, value=f"**{p1_wins}** Wins", inline=True)
+    embed.add_field(name=player2.display_name, value=f"**{p2_wins}** Wins", inline=True)
+    await ctx.followup.send(embed=embed)
+
+@stats.command(name="elo_graph", description="Generate a graph of a player's ELO over time.")
+@discord.option("player", description="The player to generate the graph for.", type=discord.Member, required=True)
+async def elo_graph(ctx: discord.ApplicationContext, player: discord.Member):
+    await ctx.defer()
+    winner_query = db.collection('match_history').where('winner_id', '==', str(player.id)).order_by('timestamp', direction='ASCENDING').stream()
+    loser_query = db.collection('match_history').where('loser_id', '==', str(player.id)).order_by('timestamp', direction='ASCENDING').stream()
+    matches = sorted(list(winner_query) + list(loser_query), key=lambda x: x.to_dict()['timestamp'])
+
+    if not matches:
+        return await ctx.followup.send("No match history found for this player to generate a graph.", ephemeral=True)
+
+    timestamps, elo_points, elo_change = [], [], 0
+    first_match_data = matches[0].to_dict()
+    initial_elo = first_match_data['winner_elo_before'] if first_match_data['winner_id'] == str(player.id) else first_match_data['loser_elo_before']
+    timestamps.append(first_match_data['timestamp'] - datetime.timedelta(minutes=1))
+    elo_points.append(initial_elo)
+    
+    current_elo = initial_elo
+    for match_doc in matches:
+        match = match_doc.to_dict()
+        elo_change = match['elo_change']
+        if match['winner_id'] == str(player.id): current_elo += elo_change
+        else: current_elo -= elo_change
+        timestamps.append(match['timestamp'])
+        elo_points.append(current_elo)
+
+    plt.style.use('dark_background')
+    fig, ax = plt.subplots()
+    ax.plot(timestamps, elo_points, marker='o', linestyle='-', color='#7289DA')
+    ax.set_title(f"ELO History for {player.display_name}", color='white')
+    ax.set_xlabel("Date", color='white')
+    ax.set_ylabel("Overall ELO", color='white')
+    ax.grid(True, linestyle='--', alpha=0.3)
+    fig.autofmt_xdate()
+    
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight', transparent=True)
+    buf.seek(0)
+    await ctx.followup.send(file=discord.File(buf, 'elo_graph.png'))
+    plt.close(fig)
 
 # -------------------------------------
 # --- Admin Commands ---
@@ -239,11 +306,25 @@ async def revert_match(ctx: discord.ApplicationContext, match_id: str):
     batch.commit()
     await ctx.followup.send(f"✅ Successfully reverted Match ID `{match_id}`.", ephemeral=True)
 
+@elo.command(name="set", description="Manually set a player's ELO in a specific region.")
+@commands.has_role(ADMIN_ROLE_NAME)
+@discord.option("player", description="The player to modify.", type=discord.Member, required=True)
+@discord.option("region", description="The region to set ELO for.", choices=["NA", "EU", "AS"], required=True)
+@discord.option("value", description="The new ELO value.", type=int, required=True)
+async def set_elo(ctx: discord.ApplicationContext, player: discord.Member, region: str, value: int):
+    await ctx.defer(ephemeral=True)
+    player_ref = db.collection('players').document(str(player.id))
+    if not player_ref.get().exists: return await ctx.followup.send("Player not found.", ephemeral=True)
+    elo_field = f'elo_{region.lower()}'
+    player_ref.update({elo_field: value})
+    await ctx.followup.send(f"✅ Set {player.display_name}'s {region} ELO to {value}.", ephemeral=True)
+
 # -------------------------------------
 # --- Register Commands & Run Bot ---
 # -------------------------------------
 bot.add_application_command(elo)
 bot.add_application_command(profile_group)
+bot.add_application_command(stats)
 
 if __name__ == "__main__":
     if BOT_TOKEN and db:
