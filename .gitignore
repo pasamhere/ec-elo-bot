@@ -1,1 +1,5 @@
+# Ignore the Python virtual environment folder
 .venv
+
+# Ignore the sensitive Firebase service account key
+serviceAccountKey.json
