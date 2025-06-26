@@ -6,6 +6,7 @@ import os
 import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
+import pychallonge # Adding this library back
 
 # -------------------------------------
 # --- Firebase Firestore Setup ---
@@ -91,6 +92,7 @@ async def on_ready():
 # -------------------------------------
 elo = SlashCommandGroup("elo", "Core ELO system commands")
 profile_group = SlashCommandGroup("profile", "Manage and view player profiles")
+challonge_group = SlashCommandGroup("challonge", "Challonge integration commands")
 
 # -------------------------------------
 # --- User Commands ---
@@ -191,11 +193,81 @@ async def set_elo(ctx: discord.ApplicationContext, player: discord.Member, regio
     player_ref.update({elo_field: value})
     await ctx.followup.send(f"✅ Set {player.display_name}'s {region} ELO to {value}.", ephemeral=True)
 
+@challonge_group.command(name="set_api_key", description="[Admin] Securely set the Challonge API key for the bot.")
+@commands.has_role(ADMIN_ROLE_NAME)
+@discord.option("api_key", description="Your Challonge API key. Find it in your Challonge settings.", required=True)
+async def set_api_key(ctx: discord.ApplicationContext, api_key: str):
+    await ctx.defer(ephemeral=True)
+    db.collection('config').document('challonge_api').set({'key': api_key})
+    await ctx.followup.send("✅ Challonge API Key has been set.", ephemeral=True)
+
+@challonge_group.command(name="link_player", description="[Admin] Manually link a player to a specific Challonge username.")
+@commands.has_role(ADMIN_ROLE_NAME)
+@discord.option("member", description="The Discord member to link.", type=discord.Member, required=True)
+@discord.option("challonge_name", description="The exact name used for them in the Challonge bracket.", required=True)
+async def link_player(ctx: discord.ApplicationContext, member: discord.Member, challonge_name: str):
+    await ctx.defer(ephemeral=True)
+    player_ref = db.collection('players').document(str(member.id))
+    if not player_ref.get().exists:
+        return await ctx.followup.send("That player is not registered in the ELO system.", ephemeral=True)
+    player_ref.update({'challonge_username': challonge_name})
+    await ctx.followup.send(f"✅ Linked **{member.display_name}** to Challonge name **{challonge_name}**.", ephemeral=True)
+
+@challonge_group.command(name="import_matches", description="[Admin] Import all completed matches from a Challonge tournament.")
+@commands.has_role(ADMIN_ROLE_NAME)
+@discord.option("tournament_url", description="The full URL of the Challonge bracket.", required=True)
+@discord.option("region", description="The region these matches were played in.", choices=["NA", "EU", "AS"], required=True)
+async def import_matches(ctx: discord.ApplicationContext, tournament_url: str, region: str):
+    await ctx.defer(ephemeral=True)
+    api_key_doc = db.collection('config').document('challonge_api').get()
+    if not api_key_doc.exists:
+        return await ctx.followup.send("Challonge API key not set. Use `/challonge set_api_key` first.", ephemeral=True)
+    
+    all_players = db.collection('players').stream()
+    player_map = {}
+    for p in all_players:
+        data = p.to_dict()
+        if data.get('roblox_username'): player_map[data['roblox_username'].lower()] = p.id
+        if data.get('challonge_username'): player_map[data['challonge_username'].lower()] = p.id
+
+    try:
+        challonge.set_credentials(os.environ.get("CHALLONGE_USER", ""), api_key_doc.to_dict().get('key'))
+        tourney_id = tournament_url.split('/')[-1] if tournament_url.split('/')[-1] else tournament_url.split('/')[-2]
+        matches = challonge.matches.index(tourney_id, state="complete")
+    except Exception as e:
+        return await ctx.followup.send(f"An error occurred while fetching data from Challonge: {e}", ephemeral=True)
+
+    success_count, failed_matches = 0, []
+    for match in matches:
+        winner_obj = challonge.participants.show(tourney_id, match['winner_id'])
+        loser_obj = challonge.participants.show(tourney_id, match['loser_id'])
+        winner_name = winner_obj.get('username') or winner_obj.get('name')
+        loser_name = loser_obj.get('username') or loser_obj.get('name')
+        winner_id = player_map.get(winner_name.lower())
+        loser_id = player_map.get(loser_name.lower())
+        
+        if not winner_id or not loser_id:
+            failed_matches.append(f"'{winner_name}' vs '{loser_name}'")
+            continue
+        
+        _, error = await process_match_elo(ctx.guild, winner_id, loser_id, region)
+        if error: failed_matches.append(f"'{winner_name}' vs '{loser_name}' ({error})")
+        else: success_count += 1
+            
+    embed = discord.Embed(title="Challonge Import Summary", color=discord.Color.blue())
+    embed.add_field(name="Successfully Imported", value=f"`{success_count}` matches.", inline=False)
+    if failed_matches:
+        embed.color = discord.Color.orange()
+        embed.add_field(name="Failed/Skipped Matches", value="\n".join(failed_matches)[:1024], inline=False)
+    await ctx.followup.send(embed=embed)
+
+
 # -------------------------------------
 # --- Register Commands & Run Bot ---
 # -------------------------------------
 bot.add_application_command(elo)
 bot.add_application_command(profile_group)
+bot.add_application_command(challonge_group)
 
 if __name__ == "__main__":
     if BOT_TOKEN and db:
